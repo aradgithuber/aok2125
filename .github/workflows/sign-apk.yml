@@ -1,0 +1,119 @@
+name: Sign APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        required: true
+        type: string
+      file_id:
+        required: true
+        type: string
+      chat_id:
+        required: true
+        type: string
+      user_id:
+        required: true
+        type: string
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install build-tools
+        run: |
+          sdkmanager "build-tools;34.0.0"
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
+
+      - name: Download APK
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          set -e
+          RESP=$(curl -s "https://api.telegram.org/bot${TOKEN}/getFile?file_id=${{ inputs.file_id }}")
+          FILE_PATH=$(echo "$RESP" | jq -r '.result.file_path // empty')
+          if [ -z "$FILE_PATH" ] || [ "$FILE_PATH" = "null" ]; then
+            echo "Failed to get file"
+            echo "$RESP"
+            exit 1
+          fi
+          curl -L -o input.apk "https://api.telegram.org/file/bot${TOKEN}/${FILE_PATH}"
+          ls -lh input.apk
+
+      - name: Generate temporary Keystore + Strip + Sign
+        run: |
+          set -e
+
+          keytool -genkeypair -v \
+            -keystore keystore.jks \
+            -alias eddie \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass eddie123456 \
+            -keypass eddie123456 \
+            -dname "CN=Eddie Signer, OU=Test, O=Eddie, C=IR" \
+            -noprompt
+
+          python3 - << 'EOF'
+          import zipfile
+          from pathlib import Path
+
+          SIG_EXTS = (".SF", ".RSA", ".DSA", ".EC")
+
+          with zipfile.ZipFile("input.apk", "r") as zin, \
+               zipfile.ZipFile("stripped.apk", "w", zipfile.ZIP_DEFLATED) as zout:
+              for item in zin.infolist():
+                  n = item.filename
+                  if n == "META-INF/MANIFEST.MF":
+                      continue
+                  if n.startswith("META-INF/") and n.upper().endswith(SIG_EXTS):
+                      continue
+                  zout.writestr(item, zin.read(n))
+          print("Signature stripped")
+          EOF
+
+         
+          zipalign -f -p 4 stripped.apk aligned.apk
+
+      
+          apksigner sign \
+            --ks keystore.jks \
+            --ks-key-alias eddie \
+            --ks-pass pass:eddie123456 \
+            --key-pass pass:eddie123456 \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            --out signed.apk \
+            aligned.apk
+
+          apksigner verify --verbose signed.apk
+          ls -lh signed.apk
+
+      - name: Send to Worker
+        env:
+          SECRET: ${{ secrets.CALLBACK_SECRET }}
+          URL: ${{ secrets.WORKER_URL }}
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${SECRET}" \
+            -F "job_id=${{ inputs.job_id }}" \
+            -F "file=@signed.apk;filename=signed.apk" \
+            "${URL}/callback" \
+            --fail --show-error --max-time 120
+
+      - name: Cleanup
+        if: always()
+        run: rm -f *.apk *.jks || true
